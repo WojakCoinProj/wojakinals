@@ -69,6 +69,8 @@ async function main() {
         await wallet()
     } else if (cmd == 'server') {
         await server()
+    } else if (cmd == 'wjk-20' || cmd == 'wjk20') {
+        await wjk20()
     } else {
         throw new Error(`unknown command: ${cmd}`)
     }
@@ -79,7 +81,7 @@ async function wallet() {
     let subcmd = process.argv[3]
 
     if (subcmd == 'new') {
-        walletNew()
+        await walletNew()
     } else if (subcmd == 'sync') {
         await walletSync()
     } else if (subcmd == 'balance') {
@@ -94,13 +96,23 @@ async function wallet() {
 }
 
 
-function walletNew() {
+async function importPrivNoRescan(privkey) {
+    try {
+        await rpc('importprivkey', [privkey, 'wojakinals', false])
+    } catch (e) {
+        if (!/already/i.test(e.message)) throw e
+    }
+}
+
+
+async function walletNew() {
     if (!fs.existsSync(WALLET_PATH)) {
         const privateKey = new PrivateKey()
         const privkey = privateKey.toWIF()
         const address = privateKey.toAddress().toString()
         const json = { privkey, address, utxos: [] }
         fs.writeFileSync(WALLET_PATH, JSON.stringify(json, 0, 2))
+        await importPrivNoRescan(privkey)
         console.log('address', address)
     } else {
         throw new Error('wallet already exists')
@@ -113,13 +125,7 @@ async function walletSync() {
 
     console.log(`syncing utxos with ${process.env.NODE_RPC_URL}`)
 
-    // Watch-only so listunspent can see mempool outputs going forward.
-    // rescan=false: confirmed history comes from scantxoutset instead.
-    try {
-        await rpc('importaddress', [wallet.address, 'wojakinals', false])
-    } catch (e) {
-        if (!/already/i.test(e.message)) throw e
-    }
+    await importPrivNoRescan(wallet.privkey)
 
     const scan = await rpc('scantxoutset', ['start', [`addr(${wallet.address})`]])
     const utxos = (scan.unspents || []).map(output => ({
@@ -212,10 +218,74 @@ async function walletSplit() {
 
 const MAX_SCRIPT_ELEMENT_SIZE = 520
 
-async function mint() {
-    const argAddress = process.argv[3]
-    const argContentTypeOrFilename = process.argv[4]
-    const argHexData = process.argv[5]
+async function wjk20() {
+    const subcmd = process.argv[3]
+    if (subcmd === 'mint' || subcmd === 'transfer') {
+        await wjk20MintOrTransfer(subcmd)
+    } else if (subcmd === 'deploy') {
+        await wjk20Deploy()
+    } else {
+        throw new Error('unknown subcommand: ' + subcmd + '\nusage: node wojakinals.js wjk-20 deploy|mint|transfer ...')
+    }
+}
+
+function wjk20Tick(tick) {
+    if (!tick || !/^[A-Za-z0-9]{2,8}$/.test(tick)) {
+        throw new Error('tick must be 2-8 alphanumeric characters')
+    }
+    return tick.toLowerCase()
+}
+
+async function wjk20Deploy() {
+    const argAddress = process.argv[4]
+    const argTicker = wjk20Tick(process.argv[5])
+    const argMax = process.argv[6]
+    const argLimit = process.argv[7]
+
+    if (!argAddress || !argMax || !argLimit) {
+        throw new Error('usage: node wojakinals.js wjk-20 deploy <address> <tick> <max> <lim>')
+    }
+
+    const payload = {
+        p: 'wjk-20',
+        op: 'deploy',
+        tick: argTicker,
+        max: String(argMax),
+        lim: String(argLimit)
+    }
+
+    console.log('deploying', JSON.stringify(payload))
+    await mint(argAddress, 'text/plain;charset=utf-8', Buffer.from(JSON.stringify(payload)).toString('hex'))
+}
+
+async function wjk20MintOrTransfer(op) {
+    const argAddress = process.argv[4]
+    const argTicker = wjk20Tick(process.argv[5])
+    const argAmount = process.argv[6]
+    const argRepeat = Number(process.argv[7]) || 1
+
+    if (!argAddress || !argAmount) {
+        throw new Error(`usage: node wojakinals.js wjk-20 ${op} <address> <tick> <amt> [repeat]`)
+    }
+
+    const payload = {
+        p: 'wjk-20',
+        op,
+        tick: argTicker,
+        amt: String(argAmount)
+    }
+
+    const hex = Buffer.from(JSON.stringify(payload)).toString('hex')
+    for (let i = 0; i < argRepeat; i++) {
+        console.log(`${op} ${argTicker} ${i + 1} of ${argRepeat}:`, JSON.stringify(payload))
+        await mint(argAddress, 'text/plain;charset=utf-8', hex)
+    }
+}
+
+async function mint(paramAddress, paramContentTypeOrFilename, paramHexData) {
+    const argAddress = paramAddress || process.argv[3]
+    const argContentTypeOrFilename = paramContentTypeOrFilename || process.argv[4]
+    const argHexData = paramHexData || process.argv[5]
 
 
     let address = new Address(argAddress)
@@ -252,7 +322,6 @@ async function broadcastAll(txs, retry) {
         console.log(`broadcasting tx ${i + 1} of ${txs.length}`)
 
         try {
-            throw new Error('hello')
             await broadcast(txs[i], retry)
         } catch (e) {
             console.log('broadcast failed', e)
@@ -263,7 +332,7 @@ async function broadcastAll(txs, retry) {
         }
     }
 
-    fs.deleteFileSync('pending-txs.json')
+    if (fs.existsSync('pending-txs.json')) fs.unlinkSync('pending-txs.json')
 
     console.log('inscription txid:', txs[1].hash)
 }
@@ -397,7 +466,9 @@ function inscribe(wallet, address, contentType, data) {
         })
 
         p2shInput.clearSignatures = () => {}
-        p2shInput.getSignatures = () => {}
+        p2shInput.getSignatures = () => []
+        p2shInput.isFullySigned = () => true
+        p2shInput.addSignature = () => {}
 
 
         lastLock = lock

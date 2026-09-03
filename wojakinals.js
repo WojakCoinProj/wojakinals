@@ -23,8 +23,34 @@ if (process.env.FEE_PER_KB) {
 
 const WALLET_PATH = process.env.WALLET || '.wallet.json'
 
-// Block explorer API, Esplora-compatible. Override for a local instance.
-const API_URL = (process.env.API_URL || 'https://api.wojakcoin.cash').replace(/\/$/, '')
+async function rpc(method, params = []) {
+    if (!process.env.NODE_RPC_URL) {
+        throw new Error('NODE_RPC_URL is not set')
+    }
+
+    try {
+        const response = await axios.post(
+            process.env.NODE_RPC_URL,
+            { jsonrpc: '1.0', id: method, method, params },
+            {
+                auth: {
+                    username: process.env.NODE_RPC_USER,
+                    password: process.env.NODE_RPC_PASS
+                }
+            }
+        )
+
+        if (response.data.error) {
+            throw new Error(response.data.error.message || JSON.stringify(response.data.error))
+        }
+
+        return response.data.result
+    } catch (e) {
+        const msg = e.response && e.response.data && e.response.data.error && e.response.data.error.message
+        if (msg) throw new Error(msg)
+        throw e
+    }
+}
 
 
 async function main() {
@@ -83,29 +109,40 @@ function walletNew() {
 
 
 async function walletSync() {
-    if (process.env.TESTNET == 'true') throw new Error('no testnet api')
-
     let wallet = JSON.parse(fs.readFileSync(WALLET_PATH))
 
-    console.log(`syncing utxos with ${API_URL}`)
+    console.log(`syncing utxos with ${process.env.NODE_RPC_URL}`)
 
-    let response = await axios.get(`${API_URL}/address/${wallet.address}/utxo`)
+    // Watch-only so listunspent can see mempool outputs going forward.
+    // rescan=false: confirmed history comes from scantxoutset instead.
+    try {
+        await rpc('importaddress', [wallet.address, 'wojakinals', false])
+    } catch (e) {
+        if (!/already/i.test(e.message)) throw e
+    }
 
-    // Esplora does not return the scriptPubKey with a UTXO the way
-    // dogechain.info did. These are all outputs paying the wallet's own
-    // address, so the script is derivable rather than worth another request
-    // each.
-    const script = Script.fromAddress(wallet.address).toHex()
+    const scan = await rpc('scantxoutset', ['start', [`addr(${wallet.address})`]])
+    const utxos = (scan.unspents || []).map(output => ({
+        txid: output.txid,
+        vout: output.vout,
+        script: output.scriptPubKey,
+        satoshis: Math.round(output.amount * 1e8)
+    }))
 
-    wallet.utxos = response.data.map(output => {
-        return {
-            txid: output.txid,
-            vout: output.vout,
-            script,
-            satoshis: output.value
-        }
-    })
+    const seen = new Set(utxos.map(u => `${u.txid}:${u.vout}`))
+    const mempool = await rpc('listunspent', [0, 0, [wallet.address]])
+    for (const utxo of mempool || []) {
+        const key = `${utxo.txid}:${utxo.vout}`
+        if (seen.has(key)) continue
+        utxos.push({
+            txid: utxo.txid,
+            vout: utxo.vout,
+            script: utxo.scriptPubKey,
+            satoshis: Math.round(utxo.amount * 1e8)
+        })
+    }
 
+    wallet.utxos = utxos
     fs.writeFileSync(WALLET_PATH, JSON.stringify(wallet, 0, 2))
 
     let balance = wallet.utxos.reduce((acc, curr) => acc + curr.satoshis, 0)
@@ -437,28 +474,13 @@ function updateWallet(wallet, tx) {
 
 
 async function broadcast(tx, retry) {
-    const body = {
-        jsonrpc: "1.0",
-        id: 0,
-        method: "sendrawtransaction",
-        params: [tx.toString()]
-    }
-
-    const options = {
-        auth: {
-            username: process.env.NODE_RPC_USER,
-            password: process.env.NODE_RPC_PASS
-        }
-    }
-
     while (true) {
         try {
-            await axios.post(process.env.NODE_RPC_URL, body, options)
+            await rpc('sendrawtransaction', [tx.toString()])
             break
         } catch (e) {
             if (!retry) throw e
-            let msg = e.response && e.response.data && e.response.data.error && e.response.data.error.message
-            if (msg && msg.includes('too-long-mempool-chain')) {
+            if (e.message && e.message.includes('too-long-mempool-chain')) {
                 console.warn('retrying, too-long-mempool-chain')
                 await new Promise(resolve => setTimeout(resolve, 1000));
             } else {
@@ -484,10 +506,37 @@ function chunkToNumber(chunk) {
 }
 
 
+async function findOutspend(txid, vout) {
+    const utxo = await rpc('gettxout', [txid, vout, true])
+    if (utxo) return null
+
+    const spends = vin => vin.txid === txid && vin.vout === vout
+
+    for (const id of await rpc('getrawmempool')) {
+        const tx = await rpc('getrawtransaction', [id, true])
+        if (tx.vin.some(spends)) return id
+    }
+
+    const origin = await rpc('getrawtransaction', [txid, true])
+    if (!origin.blockhash) return null
+
+    const header = await rpc('getblockheader', [origin.blockhash])
+    const tip = await rpc('getblockcount')
+    for (let height = header.height; height <= tip; height++) {
+        const hash = await rpc('getblockhash', [height])
+        const block = await rpc('getblock', [hash, 2])
+        for (const tx of block.tx) {
+            if (tx.vin && tx.vin.some(spends)) return tx.txid
+        }
+    }
+
+    return null
+}
+
+
 async function extract(txid) {
-    let resp = await axios.get(`${API_URL}/tx/${txid}`)
-    let transaction = resp.data
-    let script = Script.fromHex(transaction.vin[0].scriptsig)
+    let transaction = await rpc('getrawtransaction', [txid, true])
+    let script = Script.fromHex(transaction.vin[0].scriptSig.hex)
     let chunks = script.chunks
 
 
@@ -508,17 +557,13 @@ async function extract(txid) {
         let n = chunkToNumber(chunks.shift())
 
         if (n !== remaining - 1) {
-            // The rest of the inscription is in whatever spent this
-            // transaction's first output. Esplora answers that with
-            // /outspend rather than inlining it in the transaction.
-            const outspend = await axios.get(`${API_URL}/tx/${txid}/outspend/0`)
-            if (!outspend.data.spent || !outspend.data.txid) {
+            const next = await findOutspend(txid, 0)
+            if (!next) {
                 throw new Error(`inscription is incomplete: ${txid} has no continuation`)
             }
-            txid = outspend.data.txid
-            resp = await axios.get(`${API_URL}/tx/${txid}`)
-            transaction = resp.data
-            script = Script.fromHex(transaction.vin[0].scriptsig)
+            txid = next
+            transaction = await rpc('getrawtransaction', [txid, true])
+            script = Script.fromHex(transaction.vin[0].scriptSig.hex)
             chunks = script.chunks
             continue
         }

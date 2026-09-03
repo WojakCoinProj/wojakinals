@@ -17,9 +17,11 @@ npm install
 Create a `.env`:
 
 ```
-NODE_RPC_URL=http://127.0.0.1:20758
+NODE_RPC_URL=http://127.0.0.1:20760
 NODE_RPC_USER=your-rpc-user
 NODE_RPC_PASS=your-rpc-password
+
+FEE_PER_KB=100000
 ```
 
 ## Wallet
@@ -78,7 +80,7 @@ never appear:
   rather than a `spent` field on the transaction.
 - An inscription whose chain stops part-way now says so, instead of failing on
   an undefined transaction id.
-- Fees default to whatever `bitcore-lib-wojak` sets rather than 1 DOGE/kB.
+- Fees are `FEE_PER_KB` in `.env` (satoshis per KB), same as pepinals.
 
 ## License
 

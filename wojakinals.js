@@ -1,25 +1,29 @@
 #!/usr/bin/env node
 
+const dotenv = require('dotenv')
+dotenv.config()
+
 const wojakcore = require('bitcore-lib-wojak')
 const axios = require('axios')
 const fs = require('fs')
-const dotenv = require('dotenv')
 const mime = require('mime-types')
 const express = require('express')
 const { PrivateKey, Address, Transaction, Script, Opcode } = wojakcore
 const { Hash, Signature } = wojakcore.crypto
 
-dotenv.config()
-
 if (process.env.TESTNET == 'true') {
     wojakcore.Networks.defaultNetwork = wojakcore.Networks.testnet
 }
 
-// bitcore-lib-wojak already defaults to a Wojakcoin-appropriate rate; this is
-// only for overriding it.
-if (process.env.FEE_PER_KB) {
-    Transaction.FEE_PER_KB = parseInt(process.env.FEE_PER_KB)
+if (!process.env.FEE_PER_KB) {
+    throw new Error('FEE_PER_KB is not set — add it to .env (satoshis per KB)')
 }
+const FEE_PER_KB = parseInt(process.env.FEE_PER_KB, 10)
+if (!Number.isFinite(FEE_PER_KB) || FEE_PER_KB <= 0) {
+    throw new Error('FEE_PER_KB must be a positive number of satoshis per KB')
+}
+Transaction.FEE_PER_KB = FEE_PER_KB
+console.log(`fee ${Transaction.FEE_PER_KB} sat/kB`)
 
 const WALLET_PATH = process.env.WALLET || '.wallet.json'
 
@@ -59,7 +63,7 @@ async function main() {
     if (fs.existsSync('pending-txs.json')) {
         console.log('found pending-txs.json. rebroadcasting...')
         const txs = JSON.parse(fs.readFileSync('pending-txs.json'))
-        await broadcastAll(txs.map(tx => new Transaction(tx)), false)
+        await broadcastAll(txs.map(tx => new Transaction(tx)), true)
         return 
     }
 
@@ -314,7 +318,7 @@ async function mint(paramAddress, paramContentTypeOrFilename, paramHexData) {
 
     let txs = inscribe(wallet, address, contentType, data)
 
-    await broadcastAll(txs, false)
+    await broadcastAll(txs, true)
 }
 
 async function broadcastAll(txs, retry) {
@@ -334,7 +338,8 @@ async function broadcastAll(txs, retry) {
 
     if (fs.existsSync('pending-txs.json')) fs.unlinkSync('pending-txs.json')
 
-    console.log('inscription txid:', txs[1].hash)
+    const inscribed = txs[1] || txs[0]
+    if (inscribed) console.log('inscription txid:', inscribed.hash)
 }
 
 
@@ -544,19 +549,30 @@ function updateWallet(wallet, tx) {
 }
 
 
+async function waitForNextBlock() {
+    const height = await rpc('getblockcount')
+    console.warn(`too-long-mempool-chain, waiting for a block after ${height}`)
+    while (await rpc('getblockcount') === height) {
+        await new Promise(resolve => setTimeout(resolve, 5000))
+    }
+    console.warn(`new block ${await rpc('getblockcount')}`)
+}
+
 async function broadcast(tx, retry) {
     while (true) {
         try {
             await rpc('sendrawtransaction', [tx.toString()])
             break
         } catch (e) {
-            if (!retry) throw e
-            if (e.message && e.message.includes('too-long-mempool-chain')) {
-                console.warn('retrying, too-long-mempool-chain')
-                await new Promise(resolve => setTimeout(resolve, 1000));
-            } else {
-                throw e
+            const msg = e.message || ''
+            if (msg.includes('already in the mempool') || msg.includes('txn-already-in-mempool')) {
+                break
             }
+            if (retry && msg.includes('too-long-mempool-chain')) {
+                await waitForNextBlock()
+                continue
+            }
+            throw e
         }
     }
 

@@ -1,27 +1,30 @@
 #!/usr/bin/env node
 
-const dogecore = require('bitcore-lib-doge')
+const wojakcore = require('bitcore-lib-wojak')
 const axios = require('axios')
 const fs = require('fs')
 const dotenv = require('dotenv')
 const mime = require('mime-types')
 const express = require('express')
-const { PrivateKey, Address, Transaction, Script, Opcode } = dogecore
-const { Hash, Signature } = dogecore.crypto
+const { PrivateKey, Address, Transaction, Script, Opcode } = wojakcore
+const { Hash, Signature } = wojakcore.crypto
 
 dotenv.config()
 
 if (process.env.TESTNET == 'true') {
-    dogecore.Networks.defaultNetwork = dogecore.Networks.testnet
+    wojakcore.Networks.defaultNetwork = wojakcore.Networks.testnet
 }
 
+// bitcore-lib-wojak already defaults to a Wojakcoin-appropriate rate; this is
+// only for overriding it.
 if (process.env.FEE_PER_KB) {
     Transaction.FEE_PER_KB = parseInt(process.env.FEE_PER_KB)
-} else {
-    Transaction.FEE_PER_KB = 100000000
 }
 
 const WALLET_PATH = process.env.WALLET || '.wallet.json'
+
+// Block explorer API, Esplora-compatible. Override for a local instance.
+const API_URL = (process.env.API_URL || 'https://api.wojakcoin.cash').replace(/\/$/, '')
 
 
 async function main() {
@@ -84,14 +87,21 @@ async function walletSync() {
 
     let wallet = JSON.parse(fs.readFileSync(WALLET_PATH))
 
-    console.log('syncing utxos with dogechain.info api')
+    console.log(`syncing utxos with ${API_URL}`)
 
-    let response = await axios.get(`https://dogechain.info/api/v1/address/unspent/${wallet.address}`)
-    wallet.utxos = response.data.unspent_outputs.map(output => {
+    let response = await axios.get(`${API_URL}/address/${wallet.address}/utxo`)
+
+    // Esplora does not return the scriptPubKey with a UTXO the way
+    // dogechain.info did. These are all outputs paying the wallet's own
+    // address, so the script is derivable rather than worth another request
+    // each.
+    const script = Script.fromAddress(wallet.address).toHex()
+
+    wallet.utxos = response.data.map(output => {
         return {
-            txid: output.tx_hash,
-            vout: output.tx_output_n,
-            script: output.script,
+            txid: output.txid,
+            vout: output.vout,
+            script,
             satoshis: output.value
         }
     })
@@ -475,15 +485,15 @@ function chunkToNumber(chunk) {
 
 
 async function extract(txid) {
-    let resp = await axios.get(`https://dogechain.info/api/v1/transaction/${txid}`)
-    let transaction = resp.data.transaction
-    let script = Script.fromHex(transaction.inputs[0].scriptSig.hex)
+    let resp = await axios.get(`${API_URL}/tx/${txid}`)
+    let transaction = resp.data
+    let script = Script.fromHex(transaction.vin[0].scriptsig)
     let chunks = script.chunks
 
 
     let prefix = chunks.shift().buf.toString('utf8')
     if (prefix != 'ord') {
-        throw new Error('not a doginal')
+        throw new Error('not a wojakinal')
     }
 
     let pieces = chunkToNumber(chunks.shift())
@@ -498,10 +508,17 @@ async function extract(txid) {
         let n = chunkToNumber(chunks.shift())
 
         if (n !== remaining - 1) {
-            txid = transaction.outputs[0].spent.hash
-            resp = await axios.get(`https://dogechain.info/api/v1/transaction/${txid}`)
-            transaction = resp.data.transaction
-            script = Script.fromHex(transaction.inputs[0].scriptSig.hex)
+            // The rest of the inscription is in whatever spent this
+            // transaction's first output. Esplora answers that with
+            // /outspend rather than inlining it in the transaction.
+            const outspend = await axios.get(`${API_URL}/tx/${txid}/outspend/0`)
+            if (!outspend.data.spent || !outspend.data.txid) {
+                throw new Error(`inscription is incomplete: ${txid} has no continuation`)
+            }
+            txid = outspend.data.txid
+            resp = await axios.get(`${API_URL}/tx/${txid}`)
+            transaction = resp.data
+            script = Script.fromHex(transaction.vin[0].scriptsig)
             chunks = script.chunks
             continue
         }

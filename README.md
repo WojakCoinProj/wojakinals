@@ -1,169 +1,85 @@
-# Doginals
+# wojakinals
 
-A minter and protocol for inscriptions on Dogecoin. 
+Inscriptions on [Wojakcoin](https://wojakcoin.cash) — a command line minter,
+and the protocol the marketplace and indexer read.
+
+This is a fork of [doginals](https://github.com/apezord/doginals) by apezord,
+MIT licensed; the original notice is unchanged in [LICENSE](LICENSE) and the
+upstream history is kept. The protocol is apezord's. What changed here is the
+chain it points at.
 
 ## Setup
-
-Install dependencies:
 
 ```sh
 npm install
 ```
 
-Create a `.env` file with your node information:
+Create a `.env`:
 
 ```
-NODE_RPC_URL=http://<ip>:<port>
-NODE_RPC_USER=<username>
-NODE_RPC_PASS=<password>
-TESTNET=false
+NODE_RPC_URL=http://127.0.0.1:20758
+NODE_RPC_USER=your-rpc-user
+NODE_RPC_PASS=your-rpc-password
 ```
 
-## Funding
+## Wallet
 
-Generate a new `.wallet.json` file:
-
-```
-node . wallet new
-```
-
-Then send DOGE to the address displayed. Once sent, sync your wallet:
-
-```
-node . wallet sync
+```sh
+node wojakinals.js wallet new
+node wojakinals.js wallet sync      # pull UTXOs from the explorer API
+node wojakinals.js wallet balance
+node wojakinals.js wallet split 10  # split into spendable outputs
 ```
 
-If you are minting a lot, you can split up your UTXOs:
-
-```
-node . wallet split <count>
-```
-
-When you are done minting, send the funds back:
-
-```
-node . wallet send <address> <optional amount>
-```
+Send WJK to the address it prints, then `wallet sync`.
 
 ## Minting
 
-From file:
-
-```
-node . mint <address> <path>
-```
-
-From data:
-
-```
-node . mint <address> <content type> <hex data>
+```sh
+node wojakinals.js mint <address> <path/to/file>
+node wojakinals.js mint <address> text/plain "hello world"
 ```
 
-Examples:
+Content larger than one transaction is written as a chain: a commit, then a
+hop per group of data, each spending the last. See "How it is written" below —
+that detail matters if you are indexing it.
 
-```
-node . mint DSV12KPb8m5b6YtfmqY89K6YqvdVwMYDPn dog.jpeg
-```
+## Reading one back
 
-```
-node . mint DSV12KPb8m5b6YtfmqY89K6YqvdVwMYDPn "text/plain;charset=utf8" 576f6f6621 
-```
-
-**Note**: Please use a fresh wallet to mint to with nothing else in it until proper wallet for doginals support comes. You can get a paper wallet [here](https://www.fujicoin.org/wallet_generator?currency=Dogecoin).
-
-## Viewing
-
-Start the server:
-
-```
-node . server
+```sh
+node wojakinals.js wallet sync
+node wojakinals.js server            # serves inscriptions on :3000
 ```
 
-And open your browser to:
+## How it is written
+
+Each transaction reveals part of an envelope in its scriptSig:
 
 ```
-http://localhost:3000/tx/15f3b73df7e5c072becb1d84191843ba080734805addfccb650929719080f62e
+"ord" <number of chunks> <content type> (<chunks remaining> <chunk>)*
 ```
 
-## Protocol
+Two rules are easy to get wrong and produce inscriptions that confirm and then
+never appear:
 
-The doginals protocol allows any size data to be inscribed onto subwoofers.
+- A chunk and the count that introduces it must be in the **same**
+  transaction. An indexer reads the first element of each continuation
+  scriptSig as the next count, and rejects anything longer than eight bytes.
+- Revealing N groups takes **N+1** transactions. The commit reveals nothing —
+  it only pays into the first lock — and transaction *i* reveals group *i−1*.
 
-An inscription is defined as a series of push datas:
+## What differs from doginals
 
-```
-"ord"
-OP_1
-"text/plain; charset=utf8"
-OP_0
-"Woof!"
-```
+- `bitcore-lib-wojak` instead of `bitcore-lib-doge`, so addresses, WIFs and
+  network magic are Wojakcoin's.
+- UTXOs and transactions come from an Esplora-compatible API rather than
+  dogechain.info. Esplora does not return a scriptPubKey with a UTXO, so it is
+  derived from the wallet address; and following a chain uses `/outspend`
+  rather than a `spent` field on the transaction.
+- An inscription whose chain stops part-way now says so, instead of failing on
+  an undefined transaction id.
+- Fees default to whatever `bitcore-lib-wojak` sets rather than 1 DOGE/kB.
 
-For doginals, we introduce a couple extensions. First, content may spread across multiple parts:
+## License
 
-```
-"ord"
-OP_2
-"text/plain; charset=utf8"
-OP_1
-"Woof and "
-OP_0
-"woof woof!"
-```
-
-This content here would be concatenated as "Woof and woof woof!". This allows up to ~1500 bytes of data per transaction.
-
-Second, P2SH is used to encode inscriptions.
-
-There are no restrictions on what P2SH scripts may do as long as the redeem scripts start with inscription push datas.
-
-And third, inscriptions are allowed to chain across transactions:
-
-Transaction 1:
-
-```
-"ord"
-OP_2
-"text/plain; charset=utf8"
-OP_1
-"Woof and "
-```
-
-Transaction 2
-
-```
-OP_0
-"woof woof!"
-```
-
-With the restriction that each inscription part after the first must start with a number separator, and number separators must count down to 0.
-
-This allows indexers to know how much data remains.
-
-## FAQ
-
-### I'm getting ECONNREFUSED errors when minting
-
-There's a problem with the node connection. Your `dogecoin.conf` file should look something like:
-
-```
-rpcuser=ape
-rpcpassword=zord
-rpcport=22555
-server=1
-```
-
-Make sure `port` is not set to the same number as `rpcport`. Also make sure `rpcauth` is not set.
-
-Your `.env file` should look like:
-
-```
-NODE_RPC_URL=http://127.0.0.1:22555
-NODE_RPC_USER=ape
-NODE_RPC_PASS=zord
-TESTNET=false
-```
-
-### I'm getting "insufficient priority" errors when minting
-
-The miner fee is too low. You can increase it up by putting FEE_PER_KB=300000000 in your .env file or just wait it out. The default is 100000000 but spikes up when demand is high.
+MIT — see [LICENSE](LICENSE).
